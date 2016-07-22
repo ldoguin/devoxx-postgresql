@@ -1,45 +1,38 @@
 package fr.ybonnel;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import com.couchbase.client.deps.com.fasterxml.jackson.databind.ObjectMapper;
+import com.couchbase.client.java.Bucket;
+import com.couchbase.client.java.CouchbaseCluster;
+import com.couchbase.client.java.document.JsonDocument;
+import com.couchbase.client.java.document.json.JsonObject;
 import twitter4j.*;
 
-import java.sql.*;
+import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 
 public class TestOldTweets {
-
-    private static Gson gson = new GsonBuilder().setDateFormat("yyyy-MM-dd'T'HH:mm:ssZ").create();
 
     private static SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ");
 
     private static AtomicInteger counter = new AtomicInteger(0);
 
-
     private static Twitter myTwitter = TwitterFactory.getSingleton();
 
-    private static PreparedStatement preparedStatement;
-    private static Connection connection;
-
     public static void main(String[] args) throws TwitterException, ClassNotFoundException, SQLException, InterruptedException {
-        Class.forName("org.postgresql.Driver");
 
-        connection = DriverManager.getConnection("jdbc:postgresql://localhost:5434/devoxx", "devoxx", "devoxx");
-
-        preparedStatement = connection.prepareStatement("INSERT INTO tweets_devoxx_big (id, handle, tweet) VALUES (?, ?, ?::JSONB)");
+        CouchbaseCluster cc = CouchbaseCluster.create();
+        Bucket bucket = cc.openBucket("tweets_devoxx");
 
         AtomicLong cursor = new AtomicLong(-1);
         List<Long> idUsers = new ArrayList<>();
         do {
-            IDs ids = callTwitter(twitter -> twitter.getFollowersIDs("devoxxfr", cursor.get()));
+            IDs ids = callTwitter(twitter -> twitter.getFollowersIDs("couchbase", cursor.get()));
             for (long id : ids.getIDs()) {
                 idUsers.add(id);
             }
@@ -60,10 +53,10 @@ public class TestOldTweets {
 
         nb = users.size();
         for (User user : users) {
-            processTweetsOfUser(user);
+            processTweetsOfUser(user, bucket);
         }
 
-        connection.close();
+        bucket.close();
 
     }
 
@@ -96,7 +89,7 @@ public class TestOldTweets {
     private static int count = 0;
     private static int nb = 0;
 
-    private static void processTweetsOfUser(User user) throws TwitterException, InterruptedException, SQLException {
+    private static void processTweetsOfUser(User user, Bucket bucket) throws TwitterException, InterruptedException, SQLException {
         AtomicInteger page = new AtomicInteger(1);
         count++;
         System.out.println("Tweets of " + user.getName() + " / " + user.getScreenName() + " - " + count + "/" + nb);
@@ -112,7 +105,7 @@ public class TestOldTweets {
 
         ResponseList<Status> tweets;
 
-        if (tweetExistInDatabase(user.getStatus().getId())) {
+        if (tweetExistInDatabase(String.valueOf(user.getStatus().getId()), bucket)) {
             System.out.println("@" + user.getScreenName() + "(" + user.getName() + ") already totally scrapped");
             return;
         }
@@ -123,8 +116,8 @@ public class TestOldTweets {
                 return;
             }
 
-            boolean lastTweetExistInDatabase = tweetExistInDatabase(tweets.get(tweets.size() - 1).getId());
-            tweets.forEach(TestOldTweets::processTweet);
+            boolean lastTweetExistInDatabase = tweetExistInDatabase(String.valueOf(tweets.get(tweets.size() - 1).getId()), bucket);
+            tweets.forEach(tweet -> processTweet(tweet, bucket));
 
             if (lastTweetExistInDatabase) {
                 return;
@@ -135,28 +128,30 @@ public class TestOldTweets {
     }
 
 
-    private static void processTweet(Status tweet) {
-        String json = gson.toJson(tweet);
-        long id = tweet.getId();
+    private static void processTweet(Status tweet, Bucket bucket) {
+        ObjectMapper om = new ObjectMapper();
+        String id = String.valueOf(tweet.getId());
         String handle = tweet.getUser().getScreenName();
 
         try {
-            if (!tweetExistInDatabase(id)) {
-                preparedStatement.setLong(1, id);
-                preparedStatement.setString(2, handle);
-                preparedStatement.setString(3, json.replaceAll("\\\\u0000", " "));
-                preparedStatement.executeUpdate();
+            String json = om.writer().writeValueAsString(tweet);
+            JsonObject obj = JsonObject.fromJson(json);
+            obj.put("type", "tweet");
+            obj.put("handle", handle);
+            if (!tweetExistInDatabase(id, bucket)) {
+                JsonDocument jsonDocument = JsonDocument.create(id, obj);
+                bucket.upsert(jsonDocument);
                 System.out.println(counter.incrementAndGet() + " - " + sdf.format(tweet.getCreatedAt()) + " : " + count + "/" + nb + "@" + tweet.getUser().getScreenName() + "(" + tweet.getUser().getName() + "):" + tweet.getText());
             } else {
                 System.out.println(counter.incrementAndGet() + " - Already scrapped");
             }
-        } catch (SQLException e) {
+        } catch (Exception e) {
             e.printStackTrace();
             throw new RuntimeException(e);
         }
     }
 
-    private static boolean tweetExistInDatabase(long id) throws SQLException {
-        return connection.prepareCall("SELECT 1 as exist FROM tweets_devoxx_big WHERE id = " + id).executeQuery().next();
+    private static boolean tweetExistInDatabase(String id, Bucket bucket) throws SQLException {
+        return bucket.exists(id);
     }
 }
